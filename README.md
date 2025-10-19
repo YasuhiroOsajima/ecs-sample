@@ -537,4 +537,212 @@ resource "aws_scheduler_schedule" "daily_copy" {
 - VPCエンドポイント
 - CloudWatch log
 - S3バケット
-- ECSタスク実行ロールにlogs:CreateLogGroupやlogs:PutLogEventsの権限が含まれていることを確認してください。必要に応じてCloudWatchLogsFullAccessポリシーを追加します。
+
+# 11. terraformメモ
+
+```
+terraform {
+  required_version = ">= 1.5"
+  required_providers {
+    aws = { source = "hashicorp/aws", version = ">= 5.0" }
+  }
+}
+
+provider "aws" {
+  region = "ap-northeast-1"
+  #shared_credentials_file = "/Users/david/.aws/credentials"
+  profile                 = ""
+}
+
+variable "cluster_name" { default = "batch-tools" }
+variable "image"        { default = "" }
+variable "subnet_ids"   { default = [""] }
+variable "sg_id"        { default = "" }
+variable "source_bucket" { default = "" }
+variable "dest_bucket"   { default = "" }
+
+# CW Logs
+resource "aws_cloudwatch_log_group" "ecs" {
+  name              = "/ecs/s3-copy-task"
+  retention_in_days = 1
+}
+
+# IAM: execution role
+resource "aws_iam_role" "ecs_execution" {
+  name = "ecsTaskExecutionRole-s3copy"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "ecs-tasks.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+resource "aws_iam_role_policy_attachment" "ecs_exec_attach" {
+  role       = aws_iam_role.ecs_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+
+# IAM: task role with least privilege to S3
+resource "aws_iam_role" "ecs_task" {
+  name = "ecsTaskRole-s3copy"
+  assume_role_policy = aws_iam_role.ecs_execution.assume_role_policy
+}
+resource "aws_iam_policy" "s3_rw" {
+  name   = "s3copy-s3-policy"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Sid: "ReadFromSource",
+        Effect: "Allow",
+        Action: ["s3:GetObject"],
+        Resource: ["arn:aws:s3:::${var.source_bucket}/*"]
+      },
+      {
+        Sid: "ListSource",
+        Effect: "Allow",
+        Action: ["s3:ListBucket"],
+        Resource: ["arn:aws:s3:::${var.source_bucket}"]
+      },
+      {
+        Sid: "WriteToDest",
+        Effect: "Allow",
+        Action: ["s3:PutObject"],
+        Resource: ["arn:aws:s3:::${var.dest_bucket}/*"]
+      }
+    ]
+  })
+}
+resource "aws_iam_role_policy_attachment" "task_s3" {
+  role       = aws_iam_role.ecs_task.name
+  policy_arn = aws_iam_policy.s3_rw.arn
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "this" {
+  name = var.cluster_name
+}
+
+# Task Definition
+resource "aws_ecs_task_definition" "s3copy" {
+  family                   = "s3-copy-task"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.ecs_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "app",
+      image     = var.image,
+      essential = true,
+      # logConfiguration = {
+      #   logDriver = "awslogs",
+      #   options = {
+      #     awslogs-group         = aws_cloudwatch_log_group.ecs.name,
+      #     awslogs-region        = "ap-northeast-1",
+      #     awslogs-stream-prefix = "ecs"
+      #   }
+      # }
+    }
+  ])
+}
+
+# EventBridge Scheduler role
+resource "aws_iam_role" "scheduler" {
+  name = "schedulerRole-ecsRunTask-s3copy"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Effect = "Allow",
+      Principal = { Service = "scheduler.amazonaws.com" },
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+resource "aws_iam_policy" "scheduler_policy" {
+  name   = "scheduler-ecs-runtask-policy"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect: "Allow",
+        Action: ["ecs:RunTask"],
+        Resource: [aws_ecs_task_definition.s3copy.arn]
+      },
+      {
+        Effect: "Allow",
+        Action: ["iam:PassRole"],
+        Resource: [
+          aws_iam_role.ecs_execution.arn,
+          aws_iam_role.ecs_task.arn
+        ]
+      }
+    ]
+  })
+}
+resource "aws_iam_role_policy_attachment" "scheduler_attach" {
+  role       = aws_iam_role.scheduler.name
+  policy_arn = aws_iam_policy.scheduler_policy.arn
+}
+
+# EventBridge Scheduler (毎日 02:00 JST)
+resource "aws_scheduler_schedule" "daily_copy" {
+  name       = "daily-s3-copy"
+  group_name = "default"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression          = "cron(0 17 * * ? *)" # UTC 17:00 = JST 02:00
+  schedule_expression_timezone = "Asia/Tokyo"
+
+  target {
+    arn      = aws_ecs_cluster.this.arn
+    role_arn = aws_iam_role.scheduler.arn
+
+    ecs_parameters {
+      task_definition_arn = aws_ecs_task_definition.s3copy.arn
+      launch_type         = "FARGATE"
+      platform_version    = "LATEST"
+      network_configuration {
+        subnets         = var.subnet_ids
+        security_groups = [var.sg_id]
+        assign_public_ip = false # NAT or VPCエンドポイントが前提
+      }
+      task_count = 1
+      # コンテナの環境変数オーバーライド
+      tags = {} # 任意
+    }
+
+    input = jsonencode({
+      containerOverrides: [{
+        name = "app"
+        environment = [
+          {
+            name  = "SOURCE_BUCKET"
+            value = var.source_bucket
+          },
+          {
+            name  = "DEST_BUCKET"
+            value = var.dest_bucket
+          },
+          {
+            name  = "SOURCE_KEY"
+            value = "test.txt"
+          },
+          {
+            name  = "DEST_KEY"
+            value = "test.txt"
+          }
+        ]
+      }]
+    })
+  }
+}
+```
