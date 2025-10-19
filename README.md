@@ -529,3 +529,12 @@ resource "aws_scheduler_schedule" "daily_copy" {
 必要なら、あなたのバケット名やネットワーク条件（NAT あり/なし、既存 VPC ID など）に合わせて **Terraform をあなたの環境に完全一致する形**に書き換えてお渡しします。
 
 <br>
+
+# 10\. 手動で作ったもの
+- ECRレジストリ
+- ECRイメージ
+- セキュリティグループ
+- VPCエンドポイント
+- CloudWatch log
+- S3バケット
+
