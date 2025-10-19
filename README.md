@@ -537,4 +537,4 @@ resource "aws_scheduler_schedule" "daily_copy" {
 - VPCエンドポイント
 - CloudWatch log
 - S3バケット
-
+- ECSタスク実行ロールにlogs:CreateLogGroupやlogs:PutLogEventsの権限が含まれていることを確認してください。必要に応じてCloudWatchLogsFullAccessポリシーを追加します。
